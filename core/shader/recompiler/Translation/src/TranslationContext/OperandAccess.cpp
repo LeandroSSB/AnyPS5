@@ -332,7 +332,49 @@ IrU32 TranslationContext::quietNan32(IrU32 bits) {
     return ieeeMode ? IrU32(ir.BitwiseOr(bits.Value(), ir.Constant(0x00400000u))) : bits;
 }
 
+bool TranslationContext::tracesToPackedAncillary(const IrValue& value) const {
+    if (pixelInput == nullptr) {
+        return false;
+    }
+    const std::uint32_t ancillaryVgpr = pixelInput->psInputVgpr[static_cast<std::uint32_t>(PixelInput::Ancillary)];
+    if (ancillaryVgpr == ShaderPixelInputInfo::NoPixelInputVgpr) {
+        return false;
+    }
+    const IrValue* current = &value;
+    while (true) {
+        switch (current->Opcode()) {
+            case IrOpcode::BitCastF32U32:
+            case IrOpcode::BitCastU32F32:
+            case IrOpcode::BitwiseAnd32:
+            case IrOpcode::BitwiseXor32:
+            case IrOpcode::DppMoveU32:
+                current = current->Argument(0);
+                break;
+            case IrOpcode::SelectU32:
+            case IrOpcode::SelectF32:
+                current = current->Argument(2);
+                break;
+            case IrOpcode::GetBuiltin: {
+                const IrValue* kind = current->Argument(0)->Resolve();
+                return kind->HasImmediate() && kind->Type() == IrType::U32 &&
+                       kind->ImmediateU32() == static_cast<std::uint32_t>(StageInputKind::PackedAncillary);
+            }
+            case IrOpcode::GetVectorRegister: {
+                const GuestRegister reg = current->Argument(0)->Register();
+                return reg.bank == RegisterBank::Vector && reg.index == ancillaryVgpr;
+            }
+            default:
+                return false;
+        }
+    }
+}
+
 IrValue* TranslationContext::nanResultF32(std::initializer_list<IrValue*> sources, IrValue* result, IrValue* invalidProduct) {
+    for (IrValue* source : sources) {
+        if (tracesToPackedAncillary(*source)) {
+            return result;
+        }
+    }
     const auto isNan = [&](IrValue& bits) -> IrValue& { return ir.UGreaterThan(ir.BitwiseAnd(bits, ir.Constant(0x7fffffffu)), ir.Constant(0x7f800000u)); };
     IrValue* bits = &ir.BitCastU32(*result);
     bits = &ir.Select(isNan(*bits), ir.Constant(0xffc00000u), *bits);
