@@ -4,6 +4,8 @@
 
 namespace LibcUnwind {
 _Unwind_Reason_Code CallPersonality(Word personality, _Unwind_Action actions, _Unwind_Exception* exception, _Unwind_Context* context);
+bool HostOwned(const _Unwind_Exception* exception);
+void* HostUnwindEntry(const char* name);
 }
 
 static void Require(bool value) { if (!value) std::abort(); }
@@ -37,6 +39,25 @@ static void RequireInstalled(Frame& frame) {
     Require(frame.context.registers[0] == reinterpret_cast<std::uintptr_t>(&frame.exception));
     Require(frame.context.registers[1] == 0);
     Require(frame.context.registers[16] == region + 0x40);
+}
+
+static void RequireHostResumeDelegation() {
+    _Unwind_Exception exception {};
+    exception.exception_class = 0x414e5950432b2b00;
+    Require(!LibcUnwind::HostOwned(&exception));
+    exception.exception_class = 0x414e5950432b2b01;
+    Require(!LibcUnwind::HostOwned(&exception));
+    exception.exception_class = 0x474e5543432b2b00;
+    Require(LibcUnwind::HostOwned(&exception));
+    exception.exception_class = 0x474e5543432b2b01;
+    Require(LibcUnwind::HostOwned(&exception));
+    exception.exception_class = 0x54455354464f5200;
+    Require(!LibcUnwind::HostOwned(&exception));
+    exception.exception_class = 0;
+    Require(!LibcUnwind::HostOwned(&exception));
+#ifdef __linux__
+    Require(LibcUnwind::HostUnwindEntry("_Unwind_Resume") != nullptr);
+#endif
 }
 
 int main() {
@@ -87,6 +108,7 @@ int main() {
         Require(LibcUnwind::CallPersonality(0x1000, _UA_SEARCH_PHASE, &frame.exception, &frame.context) == _URC_FATAL_PHASE1_ERROR);
         Require(LibcUnwind::CallPersonality(0x1000, _UA_CLEANUP_PHASE, &frame.exception, &frame.context) == _URC_FATAL_PHASE2_ERROR);
     }
+    RequireHostResumeDelegation();
     std::puts("exception personality tests passed");
     return 0;
 }

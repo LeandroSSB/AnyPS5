@@ -2,6 +2,9 @@
 #include "prx/libc/include/specifics/linux/ElfTypes.hpp"
 #include "prx/libc/src/specifics/x86_64/RegisterContext.cpp"
 
+#ifdef __linux__
+#include <dlfcn.h>
+#endif
 #ifdef _WIN32
 #include <windows.h>
 #include <algorithm>
@@ -23,6 +26,19 @@ extern "C" _Unwind_Reason_Code __gxx_personality_v0(int, _Unwind_Action, std::ui
 extern "C" _Unwind_Reason_Code __gcc_personality_v0(int, _Unwind_Action, std::uint64_t, _Unwind_Exception*, _Unwind_Context*);
 
 namespace LibcUnwind {
+bool HostOwned(const _Unwind_Exception* exception) {
+    return (exception->exception_class & ~std::uint64_t(1)) == 0x474e5543432b2b00;
+}
+
+void* HostUnwindEntry(const char* name) {
+#if defined(__linux__) || defined(__APPLE__)
+    return dlsym(RTLD_NEXT, name);
+#else
+    (void)name;
+    return nullptr;
+#endif
+}
+
 _Unwind_Reason_Code CallPersonality(Word personality, _Unwind_Action actions, _Unwind_Exception* exception, _Unwind_Context* context) {
 #ifdef _WIN32
     const auto* code = reinterpret_cast<const Byte*>(personality);
@@ -502,6 +518,8 @@ _Unwind_Reason_Code APS5_VABI _Unwind_RaiseException_nid_postfix(_Unwind_Excepti
 }
 
 [[noreturn]] void APS5_VABI _Unwind_Resume_nid_postfix(_Unwind_Exception* exception) {
+    if (LibcUnwind::HostOwned(exception))
+        if (auto host = reinterpret_cast<void (*)(_Unwind_Exception*)>(LibcUnwind::HostUnwindEntry("_Unwind_Resume"))) host(exception);
     _Unwind_Context context;
     LibcCaptureRegisters(context.registers);
     if (!LibcUnwind::Step(context)) std::abort();
