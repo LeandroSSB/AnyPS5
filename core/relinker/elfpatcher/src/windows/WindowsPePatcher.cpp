@@ -106,7 +106,7 @@ std::vector<std::uint8_t> WindowsPePatcher::Patch(const std::vector<std::uint8_t
         nextRva = AlignRva(nextRva + sections.back().Data.size());
     }
     directories[2] = WindowsIconResourceBuilder().Build(_iconPath, sections, nextRva);
-    return WindowsPeWriter().Write(sections, entryRva, directories, _windowsGui);
+    return WindowsPeWriter().Write(sections, entryRva, directories, _windowsGui, false);
 }
 
 }
