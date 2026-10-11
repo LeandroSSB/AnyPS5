@@ -2,6 +2,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <io.h>
 #else
 #include <sys/socket.h>
 #include <sys/ioctl.h>
@@ -14,6 +15,7 @@
 #endif
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include "prx/libkernel/File/include/File.hpp"
 #include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libkernel/Time/include/TimedWait.hpp"
@@ -442,6 +444,20 @@ int NativePair(int type, NativeSocket (&pair)[2]) {
     return 0;
 }
 #endif
+#ifdef _WIN32
+short PipeEvents(int descriptor, short events) {
+    if (!DescriptorIsOpen_nid_no_patch(descriptor)) return GuestPollInvalid;
+    const auto handle = reinterpret_cast<HANDLE>(::_get_osfhandle(descriptor));
+    if (handle == INVALID_HANDLE_VALUE || ::GetFileType(handle) != FILE_TYPE_PIPE)
+        return static_cast<short>(events & (0x1 | 0x4 | 0x40 | 0x100));
+    DWORD available = 0;
+    if (!::PeekNamedPipe(handle, nullptr, 0, nullptr, &available, nullptr))
+        return static_cast<short>(events & (0x4 | 0x100));
+    if (available == 0)
+        return 0;
+    return static_cast<short>(events & (0x1 | 0x40));
+}
+#endif
 int UnnamedAddress(void* address, std::uint32_t* length) {
     const unsigned char bytes[16] = {16, GuestUnix};
     *length = std::min<std::uint32_t>(*length, sizeof(bytes));
@@ -852,12 +868,22 @@ std::int64_t APS5_VABI recvmsg_nid_postfix(int descriptor, GuestMsghdr* message,
     message->controlLength = 0;
     return received;
 }
+static void MapNativeEvents(GuestPollDescriptor& entry, short native) {
+    for (const auto& flag : RequestFlags)
+        if ((entry.events & flag.guest) && (native & flag.native))
+            entry.revents = static_cast<short>(entry.revents | flag.guest);
+    for (const auto& flag : StatusFlags)
+        if (native & flag.native) entry.revents = static_cast<short>(entry.revents | flag.guest);
+}
 int APS5_VABI poll_nid_postfix(GuestPollDescriptor* descriptors, std::uint32_t count, int timeout) {
     if (timeout < -1) return Fail(22);
     if (count && !descriptors) return Fail(14);
     std::vector<std::shared_ptr<Socket>> held;
     std::vector<NativePollDescriptor> native;
     std::vector<std::uint32_t> owners;
+#ifdef _WIN32
+    std::vector<std::uint32_t> pipes;
+#endif
     int ready = 0;
     for (std::uint32_t i = 0; i < count; ++i) {
         auto& entry = descriptors[i];
@@ -865,48 +891,92 @@ int APS5_VABI poll_nid_postfix(GuestPollDescriptor* descriptors, std::uint32_t c
         if (entry.descriptor < 0) continue;
         if ((entry.events & ~GuestPollAccepted) != 0)
             throw std::runtime_error("poll: unsupported event flags " + std::to_string(entry.events));
-        if (entry.descriptor < GuestSockets::FirstDescriptor)
-            throw std::runtime_error("poll: descriptor " + std::to_string(entry.descriptor) + " is not a socket");
-        auto socket = Find(entry.descriptor);
-        if (!socket) {
-            entry.revents = GuestPollInvalid;
-            ++ready;
-            continue;
-        }
+        NativeSocket value = Invalid;
+        if (entry.descriptor < GuestSockets::FirstDescriptor) {
 #ifdef _WIN32
-        if (entry.events & GuestPollPriority) throw std::runtime_error("poll: POLLPRI is not supported by WSAPoll");
+            if (!DescriptorIsOpen_nid_no_patch(entry.descriptor)) {
+                entry.revents = GuestPollInvalid;
+                ++ready;
+                continue;
+            }
+            pipes.push_back(i);
+            continue;
+#else
+            value = entry.descriptor;
 #endif
+        } else {
+            auto socket = Find(entry.descriptor);
+            if (!socket) {
+                entry.revents = GuestPollInvalid;
+                ++ready;
+                continue;
+            }
+#ifdef _WIN32
+            if (entry.events & GuestPollPriority) throw std::runtime_error("poll: POLLPRI is not supported by WSAPoll");
+#endif
+            value = socket->value;
+            held.push_back(std::move(socket));
+        }
         NativePollDescriptor request{};
-        request.fd = socket->value;
+        request.fd = value;
         for (const auto& flag : RequestFlags)
             if (entry.events & flag.guest) request.events = static_cast<short>(request.events | flag.native);
         native.push_back(request);
         owners.push_back(i);
-        held.push_back(std::move(socket));
     }
+#ifdef _WIN32
+    if (native.empty() && pipes.empty()) {
+#else
     if (native.empty()) {
+#endif
         if (ready || timeout == 0) return ready;
-        if (timeout < 0) throw std::runtime_error("poll: an infinite wait without sockets never returns");
+        if (timeout < 0) throw std::runtime_error("poll: an infinite wait without pollable descriptors never returns");
         std::this_thread::sleep_for(std::chrono::milliseconds(timeout));
         return 0;
     }
-    const int wait = ready ? 0 : timeout;
 #ifdef _WIN32
-    const int result = WSAPoll(native.data(), static_cast<ULONG>(native.size()), wait);
+    const auto start = std::chrono::steady_clock::now();
+    for (;;) {
+        bool pipesReady = false;
+        for (const auto index : pipes) {
+            auto& entry = descriptors[index];
+            if (!entry.revents) entry.revents = PipeEvents(entry.descriptor, entry.events);
+            if (entry.revents) pipesReady = true;
+        }
+        int slice;
+        if (ready || pipesReady) slice = 0;
+        else if (timeout < 0) slice = 50;
+        else {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start).count();
+            const auto remaining = static_cast<std::int64_t>(timeout) - elapsed;
+            slice = remaining <= 0 ? 0 : static_cast<int>(std::min<std::int64_t>(remaining, 50));
+        }
+        if (!native.empty()) {
+            const int result = WSAPoll(native.data(), static_cast<ULONG>(native.size()), slice);
+            if (result < 0) return Fail(NativeError());
+        } else if (slice > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(slice));
+        }
+        for (std::size_t i = 0; i < native.size(); ++i)
+            MapNativeEvents(descriptors[owners[i]], native[i].revents);
+        int signaled = ready;
+        for (const auto index : pipes)
+            if (descriptors[index].revents) ++signaled;
+        for (std::size_t i = 0; i < native.size(); ++i)
+            if (descriptors[owners[i]].revents) ++signaled;
+        if (signaled) return signaled;
+        if (timeout >= 0 && std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(timeout)) return 0;
+    }
 #else
-    const int result = ::poll(native.data(), static_cast<nfds_t>(native.size()), wait);
-#endif
+    const int result = ::poll(native.data(), static_cast<nfds_t>(native.size()), ready ? 0 : timeout);
     if (result < 0) return Fail(NativeError());
     for (std::size_t i = 0; i < native.size(); ++i) {
-        auto& entry = descriptors[owners[i]];
-        for (const auto& flag : RequestFlags)
-            if ((entry.events & flag.guest) && (native[i].revents & flag.native))
-                entry.revents = static_cast<short>(entry.revents | flag.guest);
-        for (const auto& flag : StatusFlags)
-            if (native[i].revents & flag.native) entry.revents = static_cast<short>(entry.revents | flag.guest);
-        if (entry.revents) ++ready;
+        MapNativeEvents(descriptors[owners[i]], native[i].revents);
+        if (descriptors[owners[i]].revents) ++ready;
     }
     return ready;
+#endif
 }
 }
 
