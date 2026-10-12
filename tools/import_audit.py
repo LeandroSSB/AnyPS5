@@ -16,6 +16,7 @@ PRX = ROOT / "core" / "libs" / "prx"
 NID = re.compile(r"[A-Za-z0-9+\-]{11}")
 EXPORT_ALIAS = re.compile(r'APS5_EXPORT\("([A-Za-z0-9+\-]{11})",\s*(\w+)\)')
 NID_POSTFIX = "_nid_postfix"
+MODULE_SUFFIX = "#"
 CLASSES = ("implemented", "stub", "absent", "module")
 PE_DIRECTORY_OFFSET = {0x20b: 112, 0x10b: 96}
 
@@ -44,17 +45,26 @@ def cstring(data, offset, limit, path, what, encoding="utf-8", errors="surrogate
         raise AuditError(f"{path}: {what} at 0x{offset:x} is not {encoding}: {error}") from error
 
 
-def elf_exports(path, data):
+def elf_sections(path, data):
     header = unpack("<16sHHIQQQIHHHHHH", data, 0, path, "ELF header")
     ident, section_offset, section_size, section_count = header[0], header[6], header[11], header[12]
     if ident[4] != 2 or ident[5] != 1 or section_size != 64:
         raise AuditError(f"{path}: only little-endian ELF64 with 64-byte section headers is supported (class {ident[4]}, data {ident[5]}, shentsize {section_size})")
     if not section_offset:
-        raise AuditError(f"{path}: ELF exports without a section header table are not supported")
+        raise AuditError(f"{path}: ELF file without a section header table is not supported")
     if not section_count:
         section_count = unpack("<IIQQQQIIQQ", data, section_offset, path, "extended section count")[5]
     take(data, section_offset, section_count * 64, path, "section header table")
-    sections = [unpack("<IIQQQQIIQQ", data, section_offset + index * 64, path, f"section header {index}") for index in range(section_count)]
+    return [unpack("<IIQQQQIIQQ", data, section_offset + index * 64, path, f"section header {index}") for index in range(section_count)]
+
+
+def elf_exports(path, data):
+    try:
+        sections = elf_sections(path, data)
+    except AuditError as error:
+        if "without a section header table" in str(error):
+            return set()
+        raise
     names = set()
     for section_index, section in enumerate(sections):
         kind, offset, size, link, entry = section[1], section[4], section[5], section[6], section[9]
@@ -82,6 +92,39 @@ def elf_exports(path, data):
                 continue
             names.add(cstring(data, strings_offset + name, strings_offset + strings_size, path, "export name"))
     return names
+
+
+def elf_imports(path, data):
+    try:
+        sections = elf_sections(path, data)
+    except AuditError as error:
+        if "without a section header table" in str(error):
+            return None
+        raise
+    symbols = set()
+    needed = set()
+    for section in sections:
+        kind, offset, size, link, entry = section[1], section[4], section[5], section[6], section[9]
+        if kind == 11:
+            if entry != 24 or size % 24 or link >= len(sections) or sections[link][1] != 3:
+                raise AuditError(f"{path}: invalid dynamic symbol table (entry size {entry}, size {size}, string table section {link})")
+            strings_offset, strings_size = sections[link][4], sections[link][5]
+            take(data, strings_offset, strings_size, path, "dynamic string table")
+            for position in range(0, size, 24):
+                name, _, _, index, _, _ = unpack("<IBBHQQ", data, offset + position, path, "dynamic symbol")
+                if name and index == 0:
+                    symbol = cstring(data, strings_offset + name, strings_offset + strings_size, path, "import name")
+                    symbols.add(symbol.split(MODULE_SUFFIX, 1)[0])
+        elif kind == 6:
+            if entry != 16 or size % 16 or link >= len(sections) or sections[link][1] != 3:
+                raise AuditError(f"{path}: invalid dynamic section (entry size {entry}, size {size}, string table section {link})")
+            strings_offset, strings_size = sections[link][4], sections[link][5]
+            take(data, strings_offset, strings_size, path, "dynamic string table")
+            for position in range(0, size, 16):
+                tag, value = unpack("<qQ", data, offset + position, path, "dynamic entry")
+                if tag == 1:
+                    needed.add(cstring(data, strings_offset + value, strings_offset + strings_size, path, "needed library name"))
+    return symbols, needed
 
 
 def pe_exports(path, data):
@@ -191,8 +234,19 @@ def built_libraries(directories):
     return {name: sorted(files) for name, files in exports.items()}, libraries
 
 
-def module_files(directories):
-    return {file.name for directory in directories for file in directory_files(directory, "*")}
+def read_modules(directories):
+    imports = {}
+    exports = defaultdict(set)
+    for directory in directories:
+        for file in directory_files(directory, "*"):
+            data = file.read_bytes()
+            own = elf_imports(file, data)
+            if own is not None:
+                symbols, needed = own
+                imports[file.name] = (sorted(symbols), sorted(needed))
+            for name in elf_exports(file, data):
+                exports[name].add(file.name)
+    return imports, {name: sorted(files) for name, files in exports.items()}
 
 
 def nid_of(name, aliases):
@@ -244,33 +298,46 @@ def check_conservation(references, records):
         raise AuditError(f"conservation failed: {references} references in, {classified} classified, unknown classes {unknown}")
 
 
-def audit(imports, exports, stubs, libraries, modules):
+def classify(nid, library, providers, stubs, modules):
+    if library and library in modules:
+        return "module"
+    if not providers:
+        return "absent"
+    if all((provider, nid) in stubs for provider in providers):
+        return "stub"
+    return "implemented"
+
+
+def audit(imports, exports, stubs, libraries, modules, module_imports=None, module_exports=None):
     records = {}
     for nid, library in imports:
         record = records.setdefault((nid, library), {"nid": nid, "library": library, "references": 0})
         record["references"] += 1
+    for module, (symbols, needed) in (module_imports or {}).items():
+        for nid in symbols:
+            record = records.setdefault((nid, None, module), {"nid": nid, "library": None, "module": module, "references": 0})
+            record["references"] += 1
     for record in records.values():
         nid, library = record["nid"], record["library"]
         providers = exports.get(nid, [])
-        if library and library in modules:
-            kind = "module"
-        elif not providers:
-            kind = "absent"
-        elif all((provider, nid) in stubs for provider in providers):
-            kind = "stub"
-        else:
-            kind = "implemented"
+        if library is None:
+            providers = sorted(set(providers) | set((module_exports or {}).get(nid, [])))
+        kind = classify(nid, library, providers, stubs, modules)
         record["class"] = kind
         record["providers"] = providers
         record["library_mismatch"] = kind in ("implemented", "stub") and bool(library) and library not in providers and "libc.prx" not in providers
         record["name"] = next((stubs[(provider, nid)] for provider in providers if (provider, nid) in stubs), None) if kind == "stub" else None
-    ordered = sorted(records.values(), key=lambda record: (record["class"], record["library"], record["nid"]))
-    check_conservation(len(imports), ordered)
+    ordered = sorted(records.values(), key=lambda record: (record["class"], record["library"] or "", record.get("module") or "", record["nid"]))
+    check_conservation(len(imports) + sum(len(symbols) for symbols, _ in (module_imports or {}).values()), ordered)
     missing = defaultdict(int)
     for record in ordered:
         library = record["library"]
         if library and library not in libraries and library not in modules:
             missing[library] += 1
+    for _, needed in (module_imports or {}).values():
+        for library in needed:
+            if library not in libraries and library not in modules:
+                missing[library] += 1
     return ordered, dict(sorted(missing.items()))
 
 
@@ -312,9 +379,11 @@ def summarize(records, references, missing):
 
 def label(record):
     if record["name"] is None:
-        return record["nid"]
-    mark = "" if record.get("name_verified", True) else " (name does not hash to this NID)"
-    return f"{record['nid']}  {record['name']}{mark}"
+        text = record["nid"]
+    else:
+        mark = "" if record.get("name_verified", True) else " (name does not hash to this NID)"
+        text = f"{record['nid']}  {record['name']}{mark}"
+    return f"{text}  (imported by {record['module']})" if record.get("module") else text
 
 
 def render(summary, records, missing):
@@ -326,7 +395,7 @@ def render(summary, records, missing):
         if selected:
             lines.append("")
             lines.append(f"{title} ({len(selected)})")
-            current = None
+            current = False
             for record in selected:
                 if record["library"] != current:
                     current = record["library"]
@@ -346,7 +415,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="classify the imports of a converted game against the built system libraries")
     parser.add_argument("registries", nargs="+", type=Path, help="JSON written by 'relinker --registry'")
     parser.add_argument("--libs", action="append", required=True, help="directory of built .prx files; repeat for several")
-    parser.add_argument("--modules", action="append", default=[], help="directory of the title's own modules; libraries named there are not checked")
+    parser.add_argument("--modules", action="append", default=[], help="directory of the title's own modules; each module's own imports are audited")
     parser.add_argument("--source", default=str(PRX), help="core/libs/prx tree used to find throwing stubs (default: this repository's)")
     parser.add_argument("--names", help="aerolib.csv style file (NID, name per line) used to name absent imports")
     parser.add_argument("--json", type=Path, help="write the full result to this file")
@@ -362,11 +431,11 @@ def main(argv=None):
                 raise AuditError(f"{args.json}: JSON output would overwrite an input file")
         imports = [entry for registry in args.registries for entry in read_registry(registry)]
         exports, libraries = built_libraries(args.libs)
-        modules = module_files(args.modules)
-        records, missing = audit(imports, exports, source_stubs(args.source), libraries, modules)
+        module_imports, module_exports = read_modules(args.modules)
+        records, missing = audit(imports, exports, source_stubs(args.source), libraries, set(module_imports), module_imports, module_exports)
         if args.names:
             attach_names(records, load_names(args.names))
-        summary = summarize(records, len(imports), missing)
+        summary = summarize(records, sum(record["references"] for record in records), missing)
         if args.json:
             commit, dirty = git_stamp(Path(args.source))
             result = {"source_commit": commit, "source_dirty": dirty, "registries": [str(path) for path in args.registries], **summary, "imports": records}
