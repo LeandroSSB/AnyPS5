@@ -22,6 +22,10 @@ int main() {
         Require(rejected);
         load.MappedAddress = 0x1000; load.MemorySize = 0x1000;
         Require(builder.ComputeExtraBlockVaddr({load}, 0x1003) == 0x2003);
+        load.MemorySize = 0x1800;
+        Require(builder.ComputeExtraBlockVaddr({load}, 0x8A00) == 0x3A00);
+        Require(builder.ComputeExtraBlockVaddr({load}, 0x8100) == 0x3100);
+        load.MemorySize = 0x1000;
         Elfpatcher::ProgramHeaderLayoutRequest valid{64, 56, 6, {load}, 0x1000, 0x2000, 0x100, 0x1000, 16, 0x1010, 8};
         std::vector<std::uint8_t> output(0x1100, 0xA5);
         Require(builder.WriteLayout(output, valid) == 6);
@@ -46,6 +50,6 @@ int main() {
             try { builder.WriteLayout(bytes, request); } catch (const std::exception&) { rejected = true; }
             Require(rejected && bytes == before);
         }
-        std::cout << "14 program layout cases passed\n";
+        std::cout << "16 program layout cases passed\n";
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }
